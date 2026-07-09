@@ -1,0 +1,1 @@
+worker: bash setup_media.sh && python bot.py
