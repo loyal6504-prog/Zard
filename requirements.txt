@@ -1,0 +1,5 @@
+python-telegram-bot[job-queue]==22.5
+Telethon==1.40.0
+requests==2.32.5
+beautifulsoup4==4.13.5
+aiohttp==3.12.15
