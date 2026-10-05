@@ -8593,7 +8593,7 @@ async def _rt_global_pace():
             await asyncio.sleep(wait)
         _RT_LAST_POST_TS[0] = time.time()
 
-RT_ORDER_WAIT_SECONDS = float(os.environ.get("RT_ORDER_WAIT_SECONDS", "25") or 25)
+RT_ORDER_WAIT_SECONDS = float(os.environ.get("RT_ORDER_WAIT_SECONDS", "30") or 25)
 
 def _rt_lower_inflight(call_key, ms):
     """True if a LOWER milestone of the same call is still queued/sending/retrying."""
@@ -8841,8 +8841,38 @@ MS_STAGGER_SECONDS = float(os.environ.get("MS_STAGGER_SECONDS", "2.0") or 2.0)
 # Early entry re-base guard (see monitoring tick). Set EARLY_REBASE_ENABLED=0 to disable.
 EARLY_REBASE_ENABLED    = str(os.environ.get("EARLY_REBASE_ENABLED", "1")).strip().lower() in ("1", "true", "yes")
 EARLY_REBASE_CHAINS     = {c.strip().upper() for c in os.environ.get("EARLY_REBASE_CHAINS", "RH").split(",") if c.strip()}
-EARLY_REBASE_MIN_RATIO  = float(os.environ.get("EARLY_REBASE_MIN_RATIO", "5") or 5)
-EARLY_REBASE_WINDOW_MIN = float(os.environ.get("EARLY_REBASE_WINDOW_MIN", "10") or 10)
+EARLY_REBASE_MIN_RATIO  = float(os.environ.get("EARLY_REBASE_MIN_RATIO", "2") or 2)
+EARLY_REBASE_WINDOW_MIN = float(os.environ.get("EARLY_REBASE_WINDOW_MIN", "45") or 45)
+
+async def _purge_points_for_milestones(call, xs):
+    """Early-rebase purge: reverse the champion points that fake (now-purged)
+    milestones had awarded for this call. Recomputes the call's tier total so
+    the incremental awards net out to exactly what was actually given."""
+    try:
+        channel = (call.get("channel") or "").lower()
+        call_key = f"{channel}_{call.get('ca','')}"
+        async with _points_lock:
+            pts = load_channel_points()
+            entry = pts.get(channel)
+            if not entry:
+                return
+            awarded = entry.get("awarded_tiers", {})
+            lst = list(awarded.get(call_key, []))
+            _before = sum(tp for tt, tp in POINT_TIERS if tt in lst)
+            _gone = {get_point_tier_reward(int(x))[0] for x in xs}
+            lst = [t for t in lst if t not in _gone]
+            _after = sum(tp for tt, tp in POINT_TIERS if tt in lst)
+            awarded[call_key] = lst
+            entry["awarded_tiers"] = awarded
+            _delta = _before - _after
+            if _delta > 0:
+                entry["points"] = max(0, entry.get("points", 0) - _delta)
+            pts[channel] = entry
+            save_channel_points(pts)
+            if _delta > 0:
+                logger.info(f"🔙 Reversed {_delta} pts @{channel} for purged fake milestones {sorted(xs)}")
+    except Exception as e:
+        logger.warning(f"purge points failed: {e}")
 
 async def rt_enqueue_milestone(bot, call_key, call, ms, cur_fmt, record_only=False, delay=0.0):
     """Queue an X alert the instant it is detected (optionally after `delay` s)."""
@@ -12264,7 +12294,10 @@ async def _process_new_call(bot, channel: str, msg_id, text: str, post_date=None
                                 for _delay in _delays:  # ~3s..48s cumulative (RH: faster, tighter)
                                     await asyncio.sleep(_delay)
                                     _cc = tracked_calls.get(_key)
-                                    if not _cc or _cc.get("entry_src") not in ("live", "live_fdv", "post_unconfirmed"):
+                                    _src_now = (_cc or {}).get("entry_src")
+                                    if (not _cc
+                                            or (_src_now not in ("live", "live_fdv", "post_unconfirmed")
+                                                and not (_chg == "RH" and _src_now == "post"))):
                                         return  # entry was overridden elsewhere — stop
                                     try:
                                         _invalidate_dex_cache(_ca)
@@ -12298,6 +12331,11 @@ async def _process_new_call(bot, channel: str, msg_id, text: str, post_date=None
                                 # — that would silently swallow every future X for it.
                                 _cc = tracked_calls.get(_key)
                                 if _cc is not None:
+                                    if (not _cc.get("entry_confirmed")
+                                            and _cc.get("entry_src") in ("live", "live_fdv", "post_unconfirmed")):
+                                        # confirmed by exhaustion, not by evidence — tag it so
+                                        # the early-rebase guard can still correct a bad quote
+                                        _cc["entry_src"] = "unverified_fail_safe"
                                     _cc["entry_confirmed"] = True
                             asyncio.create_task(_confirm_entry_mc())
 
@@ -13514,7 +13552,10 @@ async def _monitoring_job_body(context: ContextTypes.DEFAULT_TYPE, prio_mode: bo
                                 for _delay in _delays2:  # ~3s..48s cumulative (RH: much longer)
                                     await asyncio.sleep(_delay)
                                     _cc = tracked_calls.get(_key)
-                                    if not _cc or _cc.get("entry_src") not in ("live", "live_fdv", "post_unconfirmed"):
+                                    _src_now = (_cc or {}).get("entry_src")
+                                    if (not _cc
+                                            or (_src_now not in ("live", "live_fdv", "post_unconfirmed")
+                                                and not (_chg == "RH" and _src_now == "post"))):
                                         return
                                     try:
                                         _invalidate_dex_cache(_ca)
@@ -13550,6 +13591,11 @@ async def _monitoring_job_body(context: ContextTypes.DEFAULT_TYPE, prio_mode: bo
                                 if _chg != "RH":
                                     _cc = tracked_calls.get(_key)
                                     if _cc is not None:
+                                        if (not _cc.get("entry_confirmed")
+                                                and _cc.get("entry_src") in ("live", "live_fdv", "post_unconfirmed")):
+                                            # confirmed by exhaustion, not by evidence — tag it
+                                            # so the early-rebase guard can still correct it
+                                            _cc["entry_src"] = "unverified_fail_safe"
                                         _cc["entry_confirmed"] = True
                             asyncio.create_task(_confirm_entry_mc())
 
@@ -13690,28 +13736,51 @@ async def _monitoring_job_body(context: ContextTypes.DEFAULT_TYPE, prio_mode: bo
                 call["txns_buys"]     = int(dex.get("txns_buys", 0) or 0)
                 call["txns_sells"]    = int(dex.get("txns_sells", 0) or 0)
 
-                # ── EARLY ENTRY RE-BASE GUARD (2026-10-05, RH "3K entry / 40K real") ──
-                # A live-quote entry read taken at call time can be far BELOW the
-                # real MC (pool still indexing / wrong pair). The next good tick
-                # then looks like a 13X "pump" and gives the caller a free X.
-                # If a YOUNG call whose entry came from a live quote (not from the
-                # caller's own post) shows a huge jump before ANY alert was posted,
-                # treat the entry as a bad read: re-base entry to the live MC
-                # and skip alerts this tick. Tunable/disable via env.
+                # ── EARLY ENTRY RE-BASE GUARD v2 (2026-10-05) ──
+                # A live-quote entry read at call time can sit far BELOW the real
+                # MC (pool still indexing / FDV-only / wrong pair). The next good
+                # ticks then look like a pump and hand the caller free X — and the
+                # fake 2X/3X slip out ONE BY ONE (each step under the spike cap)
+                # before any single tick looks "impossible". v2 vs the original:
+                #   ratio 5 -> 2 | window 10 -> 45 min | "post"(unconfirmed) and
+                #   "unverified_fail_safe" srcs allowed | 2 consecutive elevated
+                #   ticks required | already-sent fake milestones get PURGED,
+                #   their points reversed, and the owner is notified.
                 try:
+                    _rb_src = str(call.get("entry_src") or "")
+                    _rb_src_ok = (
+                        _rb_src in ("live", "live_fdv", "post_unconfirmed", "unverified_fail_safe")
+                        or (_rb_src == "post" and not call.get("entry_confirmed"))
+                    )
+                    _rb_verified_real = bool(call.get("entry_confirmed")) and _rb_src != "unverified_fail_safe"
                     if (EARLY_REBASE_ENABLED and entry_mc > 0
                             and str(call.get("chain") or "").upper() in EARLY_REBASE_CHAINS
                             and ratio >= EARLY_REBASE_MIN_RATIO
-                            and call.get("entry_src") in ("live", "live_fdv", "post_unconfirmed")
+                            and _rb_src_ok and not _rb_verified_real
                             and not call.get("_entry_rebased")
-                            and not sent_milestones.get(call_key)):
+                            and cur_mc > 0 and not dex.get("_mc_is_fdv")):
+                        call["_rb_elevated"] = int(call.get("_rb_elevated", 0) or 0) + 1
+                    else:
+                        call["_rb_elevated"] = 0
+                    if int(call.get("_rb_elevated", 0) or 0) >= 2:
                         _ts = call.get("tracked_since", "")
                         _age_min = ((datetime.utcnow() - datetime.fromisoformat(_ts)).total_seconds() / 60.0
                                     if _ts else 9999)
                         if _age_min <= EARLY_REBASE_WINDOW_MIN:
-                            _new_mc = cur_mc if (cur_mc and cur_mc > 0 and not dex.get("_mc_is_fdv")) \
-                                else entry_mc * ratio
+                            _new_mc = cur_mc
                             _old_mc = entry_mc
+                            _fake_sent = sorted(
+                                int(x) for x in (sent_milestones.get(call_key) or set())
+                                if 2 <= int(x) <= MAX_MILESTONE)
+                            if _fake_sent:
+                                for _fx in _fake_sent:
+                                    sent_milestones[call_key].discard(_fx)
+                                    try:
+                                        milestone_times.get(call_key, {}).pop(str(_fx), None)
+                                    except Exception:
+                                        pass
+                                _save_milestones(); _save_milestone_times()
+                                await _purge_points_for_milestones(call, _fake_sent)
                             call["entry_mc"]    = _new_mc
                             call["entry_fmt"]   = fmt_mc(_new_mc)
                             _px = float(dex.get("price", 0) or 0)
@@ -13729,14 +13798,15 @@ async def _monitoring_job_body(context: ContextTypes.DEFAULT_TYPE, prio_mode: bo
                             logger.warning(
                                 f"🛠️ EARLY REBASE {call.get('symbol','?')} @{call.get('channel','?')}: "
                                 f"entry {fmt_mc(_old_mc)} → {fmt_mc(_new_mc)} "
-                                f"({ratio:.1f}x jump at {_age_min:.1f} min) — bad entry quote, no alert")
+                                f"({ratio:.1f}x at {_age_min:.1f} min) — purged fake X: {_fake_sent or 'none'}")
                             if OWNER_ID:
                                 asyncio.create_task(bot.send_message(
                                     OWNER_ID,
                                     f"🛠️ <b>Entry re-based</b> {call.get('symbol','?')} @{call.get('channel','?')}\n"
                                     f"Entry quote {fmt_mc(_old_mc)} galat tha, live MC {fmt_mc(_new_mc)} "
-                                    f"({ratio:.1f}x jump, {_age_min:.1f} min after call). "
-                                    f"Free X nahi diya gaya.", parse_mode="HTML"))
+                                    f"({ratio:.1f}x, {_age_min:.1f} min after call).\n"
+                                    f"Fake X purge: {', '.join(str(x)+'X' for x in _fake_sent) if _fake_sent else 'koi nahi'}",
+                                    parse_mode="HTML"))
                             return []
                 except Exception as _e_rb:
                     logger.warning(f"early-rebase guard skipped: {_e_rb}")
