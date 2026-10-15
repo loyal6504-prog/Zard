@@ -217,6 +217,7 @@ def _champion_rows():
                 "entryMc": lc.get("entry_mc", 0),
                 "t": t_ms,
                 "post": lc.get("msg_id") or "",
+                "series": lc.get("series") or [],
             } if lc else None,
         })
     rows.sort(key=lambda r: r["score"], reverse=True)

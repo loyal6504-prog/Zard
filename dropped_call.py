@@ -535,6 +535,7 @@ async def _process_new_call(bot, channel: str, msg_id, text: str, post_date=None
             "symbol":       "",
             "tracked_since": datetime.utcnow().isoformat(),
             "dex_pending":  True,          # milestone_job will fill this in
+            "series":       [1.0],         # price-history chart seed
         }
         _hs_register_call(channel, call_key, chain_guess)
 
