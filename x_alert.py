@@ -4133,6 +4133,25 @@ async def _monitoring_job_body(context: ContextTypes.DEFAULT_TYPE, prio_mode: bo
                 _update_peak(call, ratio, cur_mc)
                 peak_ratio = call_peak_ratio(call)
 
+                # ── Price-history sampling (website chart) ──────────────────
+                # Data only: max 1 point / 300s per call, last 96 kept.
+                # Frozen calls and invalid / <=0 / NaN ratios never append.
+                try:
+                    _rv = float(ratio or 0)
+                    if 0 < _rv < float("inf") and not call.get("frozen"):
+                        _now_ts = int(time.time())
+                        if _now_ts - int(call.get("series_ts", 0) or 0) >= 300:
+                            _ser = call.get("series")
+                            if not isinstance(_ser, list):
+                                _ser = []
+                                call["series"] = _ser
+                            _ser.append(round(_rv, 3))
+                            del _ser[:-96]
+                            call["series_ts"] = _now_ts
+                            _save_tracked()
+                except Exception:
+                    pass
+
                 # SAME-TICK plausibility cap: _remove_impossible_milestones()
                 # above only cleans up milestones from a PAST tick, after
                 # their alert already posted. That gap is exactly how a
