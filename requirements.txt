@@ -5,3 +5,4 @@ lxml
 telethon
 Pillow
 numpy
+imageio-ffmpeg
